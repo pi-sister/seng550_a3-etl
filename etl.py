@@ -22,10 +22,39 @@ PGUSER = os.getenv("PGUSER")
 PGPASSWORD = os.getenv("PGPASSWORD")
 
 # Set up SQLAlchemy engine to load data into PostgreSQL
-def get_db_engine():
+def get_db_engine(database_name=None):
     """Create SQLAlchemy engine for PostgreSQL"""
-    connection_string = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{PGDB}"
+    db_name = database_name or PGDB
+    connection_string = f"postgresql://{PGUSER}:{PGPASSWORD}@{PGHOST}:{PGPORT}/{db_name}"
     return create_engine(connection_string)
+
+def create_database_if_not_exists(db_name):
+    """Create PostgreSQL database if it doesn't exist"""
+    try:
+        # Connect to default postgres database to create new database
+        admin_engine = get_db_engine("postgres")
+        
+        with admin_engine.connect() as conn:
+            # Set autocommit mode for database creation
+            conn.execute(text("COMMIT"))
+            
+            # Check if database exists
+            result = conn.execute(text(f"""
+                SELECT 1 FROM pg_database WHERE datname = '{db_name}'
+            """))
+            
+            if not result.fetchone():
+                # Database doesn't exist, create it
+                conn.execute(text(f"CREATE DATABASE {db_name}"))
+                print(f"Database '{db_name}' created successfully")
+            else:
+                print(f"Database '{db_name}' already exists")
+                
+        admin_engine.dispose()
+        
+    except Exception as e:
+        print(f"Error creating database: {e}")
+        raise
 
 # Fetch data from API
 def fetch_data_from_api(endpoint, limit=50000):
@@ -70,7 +99,7 @@ def fetch_weather_data():
     weather_clean = weather[['date', 'min_temp_c', 'max_temp_c', 
                              'total_precip_mm']].copy()
     
-    print(f"✅ Fetched {len(weather_clean)} weather records\n")
+    print(f"Fetched {len(weather_clean)} weather records\n")
     return weather_clean
 
 # Convert GeoJSON geometry to WKT (Well-Known Text) for PostGIS
@@ -155,38 +184,42 @@ def load_to_postgres(df, table_name, engine, if_exists='replace', has_geometry=F
                     conn.execute(text(f"ALTER TABLE {table_name} DROP COLUMN geometry;"))
                     conn.execute(text(f"ALTER TABLE {table_name} RENAME COLUMN geom TO geometry;"))
                     
-                    print(f"✅ PostGIS geometry columns created")
+                    print(f"PostGIS geometry columns created")
                     
                 except Exception:
                     # PostGIS not available - add geometry type info as comment
                     conn.execute(text(f"""
                         COMMENT ON COLUMN {table_name}.geometry IS 'WKT geometry data (SRID: 4326)';
                     """))
-                    print(f"ℹ️  Geometry stored as WKT text (PostGIS unavailable)")
+                    print(f"Geometry stored as WKT text (PostGIS unavailable)")
                 
                 conn.commit()
         
-        print(f"✅ Successfully saved to '{table_name}' table")
+        print(f"Successfully saved to '{table_name}' table")
                         
         # Verify the data was saved
         with engine.connect() as conn:
             result = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}"))
             count = result.scalar()
-            print(f"📊 {count} rows verified\n")
+            print(f"{count} rows verified\n")
             
     except Exception as e:
-        print(f"❌ Error loading to {table_name}: {e}\n")
+        print(f"Error loading to {table_name}: {e}\n")
 
 
 def main():
-
-    engine = get_db_engine()    
+    # Create the PostGIS database
+    create_database_if_not_exists("postgis_db")
+    
+    # Connect to the new database
+    engine = get_db_engine("postgis_db")    
+    
     # Enable PostGIS extension
     try:
         with engine.connect() as conn:
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
             conn.commit()
-            print("✅ PostGIS extension enabled\n")
+            print("PostGIS extension enabled\n")
     except Exception as e:
         print(f"PostGIS warning: {e}\n")
     
