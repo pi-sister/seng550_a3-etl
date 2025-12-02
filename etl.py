@@ -1,3 +1,4 @@
+etl.py
 import os
 from meteostat import Point, Daily, Hourly
 from datetime import datetime
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 import requests
 import json
 from sqlalchemy import create_engine, text
+from queries import create_acc_fact_table, update_acc_fact_data
 
 load_dotenv()
 
@@ -83,7 +85,7 @@ def fetch_data_from_api(endpoint, limit=50000):
 # Fetch weather data using Meteostat
 def fetch_weather_data():    
     calgary = Point(51.0501, -114.0853, 1042) # Calgary coordinates
-    start = datetime(2025, 10, 1) # Start date
+    start = datetime(2018, 5, 5) # Start date
     end = datetime(2025, 11, 30) # End date
 
     weather_data = Daily(calgary, start, end)
@@ -158,6 +160,7 @@ def json_to_dataframe(data):
 
 
 def load_to_postgres(df, table_name, engine, if_exists='replace', has_geometry=False):
+    """Load DataFrame to PostgreSQL table with optional PostGIS geometry handling"""
     try:
         # Load data to PostgreSQL
         df.to_sql(table_name, engine, if_exists=if_exists, index=False)
@@ -207,12 +210,104 @@ def load_to_postgres(df, table_name, engine, if_exists='replace', has_geometry=F
         print(f"Error loading to {table_name}: {e}\n")
 
 
+def create_indexes(engine):
+    # Create spatial and temporal indexes to improve speed
+    # Comment this function out and create_indexes() call in main to compare speed
+    
+    with engine.connect() as conn:
+        # Spatial indexes
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_traffic_geom
+                ON traffic_incidents USING GIST (geometry);
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_boundaries_geom
+                ON community_boundaries USING GIST (geometry);
+        """))
+        
+        # Temporal indexes
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_traffic_date
+                ON traffic_incidents (start_dt);
+        """))
+        conn.execute(text("""
+            CREATE INDEX IF NOT EXISTS idx_weather_date
+                ON weather (date);
+        """))
+        
+        conn.commit()
+
+def create_materialized_view(engine):
+    # Create materialized view for faster dashboard queries
+    
+    with engine.connect() as conn:
+        # Drop if exists
+        conn.execute(text("DROP MATERIALIZED VIEW IF EXISTS accident_geo_view;"))
+        
+        # Create materialized view
+        conn.execute(text("""
+            CREATE MATERIALIZED VIEW accident_geo_view AS
+            SELECT
+                ti.start_dt AS occurred_at,
+                ti.geometry AS geom,
+                cb.name AS district_name,
+                w.date AS weather_date,
+                w.min_temp_c,
+                w.max_temp_c,
+                w.total_precip_mm,
+                ST_X(ti.geometry) AS lon,
+                ST_Y(ti.geometry) AS lat
+            FROM traffic_incidents ti
+            LEFT JOIN community_boundaries cb
+                ON ST_Contains(cb.geometry, ti.geometry)
+            LEFT JOIN weather w
+                ON w.date::date = ti.start_dt::date;
+        """))
+        
+        # Create index on materialized view
+        conn.execute(text("""
+            CREATE INDEX idx_accident_geo_view_geom 
+                ON accident_geo_view USING GIST (geom);
+        """))
+        
+        conn.commit()
+        
+        # Show row count
+        result = conn.execute(text("SELECT COUNT(*) FROM accident_geo_view;"))
+        count = result.scalar()
+
+def create_accident_analysis_table(engine):
+    #Create denormalized table for FAST accident analysis (will not be deleted on reruns)
+    
+    with engine.connect() as conn:
+        conn.execute(text(create_acc_fact_table))
+        conn.commit()
+        
+        # Show row count
+        result = conn.execute(text("SELECT COUNT(*) FROM acc_facts;"))
+        count = result.scalar()
+        print(f"Accident analysis table created with {count} records\n")
+        
+def update_accident_analysis_table(engine):
+    #Update denormalized table for SPEEDY accident analysis. This upserts existing table.
+    
+    with engine.connect() as conn:
+        conn.execute(text(update_acc_fact_data))
+        conn.commit()
+        
+        # Show row count
+        result = conn.execute(text("SELECT COUNT(*) FROM acc_facts;"))
+        count = result.scalar()
+        print(f"Accident analysis table updated with {count} records\n")
+        
+
+
 def main():
     # Create the PostGIS database
-    create_database_if_not_exists("postgis_db")
+    create_database_if_not_exists("a3_db")
     
     # Connect to the new database
-    engine = get_db_engine("postgis_db")    
+    engine = get_db_engine("a3_db")    
     
     # Enable PostGIS extension
     try:
@@ -222,27 +317,25 @@ def main():
             print("PostGIS extension enabled\n")
     except Exception as e:
         print(f"PostGIS warning: {e}\n")
+
     
-    # ========== 1. WEATHER DATA ==========
+    # ========== 1. WEATHER DATA ============================
 
     weather_df = fetch_weather_data()
     load_to_postgres(weather_df, 'weather', engine)
     
-    # ========== 2. TRAFFIC INCIDENTS ==========
+    # ========== 2. TRAFFIC INCIDENTS ======================
     traffic_data = fetch_data_from_api(API_TRAFFIC, limit=50000)
     if traffic_data:
         traffic_df = json_to_dataframe(traffic_data)
         # Available: ['count', 'latitude', 'description', 'incident_info', 'start_dt', 'modified_dt', 'longitude', 'id', 'quadrant', 'geometry']
-        traffic_clean = traffic_df[['start_dt','geometry']]
-
-        # Convert start_dt to timestamp without timezone
-        traffic_clean['start_dt'] = pd.to_datetime(traffic_clean['start_dt']).dt.tz_localize(None)
+        traffic_clean = traffic_df[['start_dt','geometry', 'modified_dt', 'id']]
         
         load_to_postgres(traffic_clean, 'traffic_incidents', engine, has_geometry=True)
     else:
         print("No traffic data fetched\n")
         
-    # ========== 3. COMMUNITY BOUNDARIES ==========
+    # ========== 3. COMMUNITY BOUNDARIES ====================
     borders_data = fetch_data_from_api(API_BORDERS, limit=50000)
     if borders_data:
         borders_df = json_to_dataframe(borders_data)
@@ -253,7 +346,12 @@ def main():
     else:
         print("No borders data fetched\n")
 
-
+    create_indexes(engine) # Actually implements the indexes
+    create_materialized_view(engine)
+    
+    # ========== 4. CREATE ACCIDENT ANALYSIS TABLE (denormalized table) ====================
+    create_accident_analysis_table(engine)
+    update_accident_analysis_table(engine)
 
 if __name__ == "__main__":
     main()

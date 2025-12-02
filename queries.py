@@ -2,6 +2,7 @@
 SQL queries for analyzing traffic accidents with spatial and temporal joins.
 Includes:
 
+
 Author: Jamie MacDonald
 """
 # Tables:
@@ -10,7 +11,11 @@ Author: Jamie MacDonald
 # community_boundaries(name, geometry)
 
 
+
+
 # ONLY ONE WEATHER BASE IN TABLE?
+
+
 
 
 # Indexing
@@ -19,18 +24,23 @@ CREATE INDEX IF NOT EXISTS idx_traffic_incidents_geom
     ON traffic_incidents
     USING GIST (geometry);
 
+
 CREATE INDEX IF NOT EXISTS idx_community_boundaries_geom
     ON community_boundaries
     USING GIST (geometry);
 """
 
+
 temporal_indexes = """
 CREATE INDEX IF NOT EXISTS idx_weather_date
     ON weather (date);
 
+
 CREATE INDEX IF NOT EXISTS idx_traffic_incidents_start_dt
     ON traffic_incidents (start_dt);
 """
+
+
 
 
 # View for less joins
@@ -52,6 +62,8 @@ LEFT JOIN weather w
 """
 
 
+
+
 # Queries
 # Accidents per community district
 acc_district_query = """
@@ -64,6 +76,7 @@ LEFT JOIN traffic_incidents ti
 GROUP BY cb.name, cb.geometry;
 """
 
+
 # Incidents per day and precipitation
 acc_day_precip_query = """
 SELECT
@@ -74,12 +87,80 @@ FROM weather w
 LEFT JOIN traffic_incidents ti
     ON w.date = ti.start_dt::date
 GROUP BY w.date, w.total_precip_mm
-ORDER BY w.date; 
+ORDER BY w.date;
+"""
+
+# Table for accident analysis with weather data
+create_acc_fact_table = """
+CREATE TABLE IF NOT EXISTS accident_facts (
+    ti.id AS incident_id,
+    ti.start_dt::date AS occurred_date,
+    ti.modified_dt AS modified_dt,
+    cb.name AS community_name,
+    w.min_temp_c,
+    w.max_temp_c,
+    w.total_precip_mm,
+    ST_X(ti.geometry) AS accident_lon,
+    ST_Y(ti.geometry) AS accident_lat,
+    ti.geometry AS accident_geom,
+    cb.geometry AS community_geom
+FROM traffic_incidents ti
+LEFT JOIN community_boundaries cb
+    ON ST_Contains(cb.geometry, ti.geometry)
+LEFT JOIN weather w
+    ON ti.start_dt::date = w.date;
+    
+-- Indexes for fast querying
+CREATE INDEX IF NOT EXISTS idx_accident_facts_geom
+    ON accident_facts USING GIST (accident_geom);
+CREATE INDEX IF NOT EXISTS idx_accident_facts_date
+    ON accident_facts (occurred_date);
+CREATE INDEX IF NOT EXISTS idx_accident_facts_community
+    ON accident_facts (community_name);
+CREATE INDEX IF NOT EXISTS idx_accident_facts_precip
+    ON accident_facts (total_precip_mm);
+"""
+
+update_acc_fact_data = """
+INSERT INTO accident_facts (
+    incident_id,
+    occurred_date,
+    modified_dt,
+    community_name,
+    min_temp_c,
+    max_temp_c,
+    total_precip_mm,
+    geometry
+)
+SELECT
+    ti.id AS incident_id,
+    ti.start_dt::date AS occurred_date,
+    ti.modified_dt AS modified_dt,
+    cb.name AS community_name,
+    w.min_temp_c,
+    w.max_temp_c,
+    w.total_precip_mm,
+    ti.geometry
+FROM traffic_incidents ti
+LEFT JOIN community_boundaries cb
+    ON ST_Contains(cb.geometry, ti.geometry)
+LEFT JOIN weather w
+    ON ti.start_dt::date = w.date
+ON CONFLICT (incident_id) DO UPDATE 
+SET
+    occurred_date = EXCLUDED.occurred_date,
+    modified_dt = EXCLUDED.modified_dt,
+    community_name = EXCLUDED.community_name,
+    min_temp_c = EXCLUDED.min_temp_c,
+    max_temp_c = EXCLUDED.max_temp_c,
+    total_precip_mm = EXCLUDED.total_precip_mm,
+    geometry = EXCLUDED.geometry;
+WHERE accident_facts.modified_dt < EXCLUDED.modified_dt; -- only update if new data is more recent
 """
 
 
 
-# Accidents with weather conditions at time and location of accident - 
+# Accidents with weather conditions at time and location of accident -
 # FOR MULTIPLE WEATHER BASES, not implemented (yet)
 # acc_weather_query = """
 # SELECT
@@ -107,3 +188,4 @@ ORDER BY w.date;
 #     LIMIT 1
 # ) w ON TRUE;
 # """
+
